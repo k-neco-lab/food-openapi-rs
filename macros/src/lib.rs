@@ -56,7 +56,13 @@ fn extract_query_type(fn_item: &ItemFn) -> Option<Type> {
     None
 }
 
+/// Check if a type is the unit type ()
+fn is_unit_type(ty: &Type) -> bool {
+    matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty())
+}
+
 /// Extract response body type from Result<Json<T>, E> or Json<T>
+/// Returns None if the type is ()
 fn extract_response_type(fn_item: &ItemFn) -> Option<Type> {
     if let ReturnType::Type(_, ty) = &fn_item.sig.output {
         if let Type::Path(type_path) = &**ty {
@@ -66,6 +72,10 @@ fn extract_response_type(fn_item: &ItemFn) -> Option<Type> {
             if segment.ident == "Json" {
                 if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                     if let Some(syn::GenericArgument::Type(inner_type)) = args.args.first() {
+                        // Skip unit type
+                        if is_unit_type(inner_type) {
+                            return None;
+                        }
                         return Some(inner_type.clone());
                     }
                 }
@@ -84,6 +94,10 @@ fn extract_response_type(fn_item: &ItemFn) -> Option<Type> {
                                 if let Some(syn::GenericArgument::Type(inner_type)) =
                                     json_args.args.first()
                                 {
+                                    // Skip unit type
+                                    if is_unit_type(inner_type) {
+                                        return None;
+                                    }
                                     return Some(inner_type.clone());
                                 }
                             }
@@ -147,12 +161,13 @@ pub fn route(args: TokenStream, input: TokenStream) -> TokenStream {
     } else {
         quote! {
             fn __schemas() -> Vec<(&'static str, utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>)> {
+                use super::*;
                 use std::borrow::Cow;
                 vec![
                     #(
                         {
-                            let name: Cow<'static, str> = <super::#schema_types as utoipa::ToSchema>::name();
-                            let schema = <super::#schema_types as utoipa::PartialSchema>::schema();
+                            let name: Cow<'static, str> = <#schema_types as utoipa::ToSchema>::name();
+                            let schema = <#schema_types as utoipa::PartialSchema>::schema();
                             (Box::leak(name.into_owned().into_boxed_str()) as &'static str, schema)
                         }
                     ),*
@@ -167,53 +182,96 @@ pub fn route(args: TokenStream, input: TokenStream) -> TokenStream {
     let operation_builder = if let Some(req_type) = &request_type {
         if let Some(resp_type) = &response_type {
             quote! {
-                utoipa::openapi::path::OperationBuilder::new()
-                    .request_body(Some(utoipa::openapi::request_body::RequestBodyBuilder::new()
-                        .content(
-                            "application/json",
-                            utoipa::openapi::ContentBuilder::new()
-                                .schema(Some(<super::#req_type as utoipa::PartialSchema>::schema()))
-                                .build()
-                        )
-                        .build()))
-                    .response(
-                        "200",
-                        utoipa::openapi::ResponseBuilder::new()
-                            .description("")
+                {
+                    use super::*;
+                    utoipa::openapi::path::OperationBuilder::new()
+                        .request_body(Some(utoipa::openapi::request_body::RequestBodyBuilder::new()
                             .content(
                                 "application/json",
                                 utoipa::openapi::ContentBuilder::new()
-                                    .schema(Some(<super::#resp_type as utoipa::PartialSchema>::schema()))
+                                    .schema(Some(<#req_type as utoipa::PartialSchema>::schema()))
                                     .build()
                             )
-                            .build()
-                    )
-                    .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                    .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                    .build()
+                            .build()))
+                        .response(
+                            "200",
+                            utoipa::openapi::ResponseBuilder::new()
+                                .description("")
+                                .content(
+                                    "application/json",
+                                    utoipa::openapi::ContentBuilder::new()
+                                        .schema(Some(<#resp_type as utoipa::PartialSchema>::schema()))
+                                        .build()
+                                )
+                                .build()
+                        )
+                        .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
+                        .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
+                        .build()
+                }
             }
         } else {
             quote! {
-                utoipa::openapi::path::OperationBuilder::new()
-                    .request_body(Some(utoipa::openapi::request_body::RequestBodyBuilder::new()
-                        .content(
-                            "application/json",
-                            utoipa::openapi::ContentBuilder::new()
-                                .schema(Some(<super::#req_type as utoipa::PartialSchema>::schema()))
-                                .build()
-                        )
-                        .build()))
-                    .response("200", utoipa::openapi::ResponseBuilder::new().description("").build())
-                    .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                    .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                    .build()
+                {
+                    use super::*;
+                    utoipa::openapi::path::OperationBuilder::new()
+                        .request_body(Some(utoipa::openapi::request_body::RequestBodyBuilder::new()
+                            .content(
+                                "application/json",
+                                utoipa::openapi::ContentBuilder::new()
+                                    .schema(Some(<#req_type as utoipa::PartialSchema>::schema()))
+                                    .build()
+                            )
+                            .build()))
+                        .response("200", utoipa::openapi::ResponseBuilder::new().description("").build())
+                        .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
+                        .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
+                        .build()
+                }
             }
         }
     } else if let Some(query_type) = &query_type {
         if let Some(resp_type) = &response_type {
             quote! {
+                {
+                    use super::*;
+                    utoipa::openapi::path::OperationBuilder::new()
+                        .parameters(Some(<#query_type as utoipa::IntoParams>::into_params(|| None)))
+                        .response(
+                            "200",
+                            utoipa::openapi::ResponseBuilder::new()
+                                .description("")
+                                .content(
+                                    "application/json",
+                                    utoipa::openapi::ContentBuilder::new()
+                                        .schema(Some(<#resp_type as utoipa::PartialSchema>::schema()))
+                                        .build()
+                                )
+                                .build()
+                        )
+                        .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
+                        .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
+                        .build()
+                }
+            }
+        } else {
+            quote! {
+                {
+                    use super::*;
+                    utoipa::openapi::path::OperationBuilder::new()
+                        .parameters(Some(<#query_type as utoipa::IntoParams>::into_params(|| None)))
+                        .response("200", utoipa::openapi::ResponseBuilder::new().description("").build())
+                        .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
+                        .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
+                        .build()
+                }
+            }
+        }
+    } else if let Some(resp_type) = &response_type {
+        quote! {
+            {
+                use super::*;
                 utoipa::openapi::path::OperationBuilder::new()
-                    .parameters(Some(<super::#query_type as utoipa::IntoParams>::into_params(|| None)))
                     .response(
                         "200",
                         utoipa::openapi::ResponseBuilder::new()
@@ -221,7 +279,7 @@ pub fn route(args: TokenStream, input: TokenStream) -> TokenStream {
                             .content(
                                 "application/json",
                                 utoipa::openapi::ContentBuilder::new()
-                                    .schema(Some(<super::#resp_type as utoipa::PartialSchema>::schema()))
+                                    .schema(Some(<#resp_type as utoipa::PartialSchema>::schema()))
                                     .build()
                             )
                             .build()
@@ -230,34 +288,6 @@ pub fn route(args: TokenStream, input: TokenStream) -> TokenStream {
                     .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
                     .build()
             }
-        } else {
-            quote! {
-                utoipa::openapi::path::OperationBuilder::new()
-                    .parameters(Some(<super::#query_type as utoipa::IntoParams>::into_params(|| None)))
-                    .response("200", utoipa::openapi::ResponseBuilder::new().description("").build())
-                    .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                    .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                    .build()
-            }
-        }
-    } else if let Some(resp_type) = &response_type {
-        quote! {
-            utoipa::openapi::path::OperationBuilder::new()
-                .response(
-                    "200",
-                    utoipa::openapi::ResponseBuilder::new()
-                        .description("")
-                        .content(
-                            "application/json",
-                            utoipa::openapi::ContentBuilder::new()
-                                .schema(Some(<super::#resp_type as utoipa::PartialSchema>::schema()))
-                                .build()
-                        )
-                        .build()
-                )
-                .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                .build()
         }
     } else {
         quote! {
