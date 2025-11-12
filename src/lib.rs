@@ -8,6 +8,14 @@ pub use inventory;
 /// Re-export the route macro from macros crate
 pub use food_openapi_rs_macros::route;
 
+/// Standard error response structure
+///
+/// This is a common error response format that can be used across different APIs.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
 /// Type alias for schema entry: (name, schema)
 pub type SchemaEntry = (
     &'static str,
@@ -124,6 +132,31 @@ pub fn build_error_response_from_schema(
 #[must_use]
 pub fn build_openapi(title: &str, version: &str) -> OpenApi {
     build_openapi_with_components(title, version, Vec::new(), None)
+}
+
+/// Build `OpenAPI` documentation with standard error response
+///
+/// This is the recommended way to build OpenAPI documentation.
+/// It automatically includes a standard ErrorResponse in components.responses
+/// and resolves all nested schema references.
+///
+/// # Example
+/// ```ignore
+/// let openapi = build_openapi_with_error_response("my-api", "1.0.0");
+/// ```
+#[must_use]
+pub fn build_openapi_with_error_response(title: &str, version: &str) -> OpenApi {
+    use utoipa::PartialSchema;
+
+    build_openapi_with_components(
+        title,
+        version,
+        Vec::new(),
+        Some((
+            "ErrorResponse",
+            build_error_response_from_schema(ErrorResponse::schema()),
+        )),
+    )
 }
 
 /// Build `OpenAPI` documentation with additional components

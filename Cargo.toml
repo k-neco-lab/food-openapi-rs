@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 food-openapi-rs-macros = { path = "./macros" }
 inventory = "0.3"
+serde = { version = "1", features = ["derive"] }
 utoipa = "5"
 
 # Re-export macros
