@@ -18,6 +18,34 @@ inventory::collect!(ApiEntry);
 
 /// Build OpenAPI documentation from collected API entries
 pub fn build_openapi(title: &str, version: &str) -> OpenApi {
+    build_openapi_with_components(title, version, Vec::new())
+}
+
+/// Build OpenAPI documentation with additional component schemas
+///
+/// This is useful for adding common schemas like error responses that are referenced
+/// by routes but not automatically collected (e.g., via #[response] attributes).
+///
+/// # Example
+/// ```ignore
+/// use utoipa::{ToSchema, PartialSchema};
+///
+/// #[derive(ToSchema)]
+/// struct ErrorResponse {
+///     error: String,
+/// }
+///
+/// let openapi = build_openapi_with_components(
+///     "my-api",
+///     "1.0.0",
+///     vec![("ErrorResponse", ErrorResponse::schema())]
+/// );
+/// ```
+pub fn build_openapi_with_components(
+    title: &str,
+    version: &str,
+    additional_schemas: Vec<(&str, utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>)>,
+) -> OpenApi {
     let mut paths_builder = PathsBuilder::new();
     let mut components = Components::default();
 
@@ -30,6 +58,11 @@ pub fn build_openapi(title: &str, version: &str) -> OpenApi {
         for (name, schema) in (entry.schemas)() {
             components.schemas.insert(name.to_string(), schema);
         }
+    }
+
+    // Add additional schemas
+    for (name, schema) in additional_schemas {
+        components.schemas.insert(name.to_string(), schema);
     }
 
     OpenApiBuilder::new()
