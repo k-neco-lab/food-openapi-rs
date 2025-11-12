@@ -1,7 +1,15 @@
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, FnArg, ItemFn, LitStr, PatType, ReturnType, Type};
+
+// Constants for magic values
+const CONTENT_TYPE_JSON: &str = "application/json";
+const STATUS_OK: &str = "200";
+const STATUS_BAD_REQUEST: &str = "400";
+const STATUS_INTERNAL_ERROR: &str = "500";
+const ERROR_RESPONSE_REF: &str = "ErrorResponse";
 
 /// Parse route attribute arguments
 /// Example: POST "/account/register"
@@ -18,42 +26,98 @@ impl Parse for RouteArgs {
     }
 }
 
-/// Extract request body type from function signature
-fn extract_request_type(fn_item: &ItemFn) -> Option<Type> {
-    for arg in &fn_item.sig.inputs {
-        if let FnArg::Typed(PatType { ty, .. }) = arg {
-            if let Type::Path(type_path) = &**ty {
-                let segment = type_path.path.segments.last()?;
-                if segment.ident == "Json" {
-                    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                        if let Some(syn::GenericArgument::Type(inner_type)) = args.args.first() {
-                            return Some(inner_type.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+/// Supported HTTP methods
+enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Delete,
+    Patch,
 }
 
-/// Extract query parameter type from function signature
-fn extract_query_type(fn_item: &ItemFn) -> Option<Type> {
-    for arg in &fn_item.sig.inputs {
-        if let FnArg::Typed(PatType { ty, .. }) = arg {
-            if let Type::Path(type_path) = &**ty {
-                let segment = type_path.path.segments.last()?;
-                if segment.ident == "Query" {
-                    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                        if let Some(syn::GenericArgument::Type(inner_type)) = args.args.first() {
-                            return Some(inner_type.clone());
-                        }
-                    }
-                }
-            }
+impl HttpMethod {
+    fn from_ident(ident: &syn::Ident) -> Result<Self, syn::Error> {
+        let method_str = ident.to_string().to_lowercase();
+        match method_str.as_str() {
+            "get" => Ok(Self::Get),
+            "post" => Ok(Self::Post),
+            "put" => Ok(Self::Put),
+            "delete" => Ok(Self::Delete),
+            "patch" => Ok(Self::Patch),
+            _ => Err(syn::Error::new_spanned(
+                ident,
+                format!(
+                    "Unsupported HTTP method '{method_str}'. Supported: GET, POST, PUT, DELETE, PATCH"
+                ),
+            )),
         }
     }
-    None
+
+    fn axum_routing(&self) -> TokenStream2 {
+        match self {
+            Self::Get => quote! { axum::routing::get },
+            Self::Post => quote! { axum::routing::post },
+            Self::Put => quote! { axum::routing::put },
+            Self::Delete => quote! { axum::routing::delete },
+            Self::Patch => quote! { axum::routing::patch },
+        }
+    }
+
+    fn utoipa_method(&self) -> TokenStream2 {
+        match self {
+            Self::Get => quote! { utoipa::openapi::path::HttpMethod::Get },
+            Self::Post => quote! { utoipa::openapi::path::HttpMethod::Post },
+            Self::Put => quote! { utoipa::openapi::path::HttpMethod::Put },
+            Self::Delete => quote! { utoipa::openapi::path::HttpMethod::Delete },
+            Self::Patch => quote! { utoipa::openapi::path::HttpMethod::Patch },
+        }
+    }
+}
+
+/// Extract inner type from a generic wrapper (e.g., Json<T>, Query<T>)
+fn extract_inner_type(ty: &Type, wrapper_name: &str) -> Option<Type> {
+    let type_path = match ty {
+        Type::Path(type_path) => type_path,
+        _ => return None,
+    };
+
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != wrapper_name {
+        return None;
+    }
+
+    let args = match &segment.arguments {
+        syn::PathArguments::AngleBracketed(args) => args,
+        _ => return None,
+    };
+
+    match args.args.first() {
+        Some(syn::GenericArgument::Type(inner_type)) => Some(inner_type.clone()),
+        _ => None,
+    }
+}
+
+/// Extract type from function parameters wrapped in a specific container
+fn extract_wrapper_type(fn_item: &ItemFn, wrapper_name: &str) -> Option<Type> {
+    fn_item
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            FnArg::Typed(PatType { ty, .. }) => Some(&**ty),
+            _ => None,
+        })
+        .find_map(|ty| extract_inner_type(ty, wrapper_name))
+}
+
+/// Extract request body type from function signature (Json<T>)
+fn extract_request_type(fn_item: &ItemFn) -> Option<Type> {
+    extract_wrapper_type(fn_item, "Json")
+}
+
+/// Extract query parameter type from function signature (Query<T>)
+fn extract_query_type(fn_item: &ItemFn) -> Option<Type> {
+    extract_wrapper_type(fn_item, "Query")
 }
 
 /// Check if a type is the unit type ()
@@ -61,67 +125,129 @@ fn is_unit_type(ty: &Type) -> bool {
     matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty())
 }
 
+/// Try to extract Json<T> from a type
+fn try_extract_json(ty: &Type) -> Option<Type> {
+    extract_inner_type(ty, "Json").filter(|t| !is_unit_type(t))
+}
+
+/// Try to extract T from Result<Json<T>, E>
+fn try_extract_result_json(ty: &Type) -> Option<Type> {
+    let result_inner = extract_inner_type(ty, "Result")?;
+    try_extract_json(&result_inner)
+}
+
 /// Extract response body type from Result<Json<T>, E> or Json<T>
 /// Returns None if the type is ()
 fn extract_response_type(fn_item: &ItemFn) -> Option<Type> {
-    if let ReturnType::Type(_, ty) = &fn_item.sig.output {
-        if let Type::Path(type_path) = &**ty {
-            let segment = type_path.path.segments.last()?;
+    let return_type = match &fn_item.sig.output {
+        ReturnType::Type(_, ty) => &**ty,
+        _ => return None,
+    };
 
-            // Try Json<T> first
-            if segment.ident == "Json" {
-                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                    if let Some(syn::GenericArgument::Type(inner_type)) = args.args.first() {
-                        // Skip unit type
-                        if is_unit_type(inner_type) {
-                            return None;
-                        }
-                        return Some(inner_type.clone());
-                    }
-                }
+    // Try Json<T> first, then Result<Json<T>, E>
+    try_extract_json(return_type).or_else(|| try_extract_result_json(return_type))
+}
+
+/// Configuration for building OpenAPI operation
+struct OperationConfig<'a> {
+    request_type: Option<&'a Type>,
+    query_type: Option<&'a Type>,
+    response_type: Option<&'a Type>,
+}
+
+impl OperationConfig<'_> {
+    fn build_request_body(&self) -> Option<TokenStream2> {
+        self.request_type.map(|req_type| {
+            quote! {
+                Some(utoipa::openapi::request_body::RequestBodyBuilder::new()
+                    .content(
+                        #CONTENT_TYPE_JSON,
+                        utoipa::openapi::ContentBuilder::new()
+                            .schema(Some(<#req_type as utoipa::PartialSchema>::schema()))
+                            .build()
+                    )
+                    .build())
             }
+        })
+    }
 
-            // Then try Result<Json<T>, E>
-            if segment.ident == "Result" {
-                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                    if let Some(syn::GenericArgument::Type(Type::Path(ok_type))) = args.args.first()
-                    {
-                        let json_segment = ok_type.path.segments.last()?;
-                        if json_segment.ident == "Json" {
-                            if let syn::PathArguments::AngleBracketed(json_args) =
-                                &json_segment.arguments
-                            {
-                                if let Some(syn::GenericArgument::Type(inner_type)) =
-                                    json_args.args.first()
-                                {
-                                    // Skip unit type
-                                    if is_unit_type(inner_type) {
-                                        return None;
-                                    }
-                                    return Some(inner_type.clone());
-                                }
-                            }
-                        }
-                    }
-                }
+    fn build_parameters(&self) -> Option<TokenStream2> {
+        self.query_type.map(|query_type| {
+            quote! {
+                Some(<#query_type as utoipa::IntoParams>::into_params(|| None))
+            }
+        })
+    }
+
+    fn build_success_response(&self) -> TokenStream2 {
+        if let Some(resp_type) = self.response_type {
+            quote! {
+                utoipa::openapi::ResponseBuilder::new()
+                    .description("")
+                    .content(
+                        #CONTENT_TYPE_JSON,
+                        utoipa::openapi::ContentBuilder::new()
+                            .schema(Some(<#resp_type as utoipa::PartialSchema>::schema()))
+                            .build()
+                    )
+                    .build()
+            }
+        } else {
+            quote! {
+                utoipa::openapi::ResponseBuilder::new()
+                    .description("")
+                    .build()
             }
         }
     }
-    None
+
+    fn build_operation(&self) -> TokenStream2 {
+        let request_body = self.build_request_body();
+        let parameters = self.build_parameters();
+        let success_response = self.build_success_response();
+
+        let mut builder = quote! {
+            utoipa::openapi::path::OperationBuilder::new()
+        };
+
+        if let Some(req_body) = request_body {
+            builder = quote! {
+                #builder.request_body(#req_body)
+            };
+        }
+
+        if let Some(params) = parameters {
+            builder = quote! {
+                #builder.parameters(#params)
+            };
+        }
+
+        quote! {
+            {
+                use super::*;
+                #builder
+                    .response(#STATUS_OK, #success_response)
+                    .response(#STATUS_BAD_REQUEST, utoipa::openapi::Ref::from_response_name(#ERROR_RESPONSE_REF))
+                    .response(#STATUS_INTERNAL_ERROR, utoipa::openapi::Ref::from_response_name(#ERROR_RESPONSE_REF))
+                    .build()
+            }
+        }
+    }
 }
 
 /// Attribute macro for marking route handlers
 /// Usage: #[route(POST "/account/register")]
-///
-/// # Panics
-/// Panics if an unsupported HTTP method is provided
 #[proc_macro_attribute]
-#[allow(clippy::too_many_lines, clippy::option_if_let_else)]
 pub fn route(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as RouteArgs);
     let fn_item = parse_macro_input!(input as ItemFn);
 
-    let method = args.method.to_string().to_lowercase();
+    // Parse HTTP method
+    let http_method = match HttpMethod::from_ident(&args.method) {
+        Ok(method) => method,
+        Err(err) => return err.to_compile_error().into(),
+    };
+
     let path = args.path.value();
     let fn_name = &fn_item.sig.ident;
 
@@ -131,25 +257,19 @@ pub fn route(args: TokenStream, input: TokenStream) -> TokenStream {
     let response_type = extract_response_type(&fn_item);
 
     // Generate routing method
-    let route_method = match method.as_str() {
-        "get" => quote! { axum::routing::get },
-        "post" => quote! { axum::routing::post },
-        "put" => quote! { axum::routing::put },
-        "delete" => quote! { axum::routing::delete },
-        "patch" => quote! { axum::routing::patch },
-        _ => panic!("Unsupported HTTP method: {method}"),
-    };
+    let route_method = http_method.axum_routing();
+    let utoipa_method = http_method.utoipa_method();
 
     // Generate schema collection
     let mut schema_types = Vec::new();
-    if let Some(req_type) = &request_type {
-        schema_types.push(req_type.clone());
+    if let Some(ref req_type) = request_type {
+        schema_types.push(req_type);
     }
-    if let Some(query_type) = &query_type {
-        schema_types.push(query_type.clone());
+    if let Some(ref query_type) = query_type {
+        schema_types.push(query_type);
     }
-    if let Some(resp_type) = &response_type {
-        schema_types.push(resp_type.clone());
+    if let Some(ref resp_type) = response_type {
+        schema_types.push(resp_type);
     }
 
     let schemas_fn = if schema_types.is_empty() {
@@ -168,6 +288,9 @@ pub fn route(args: TokenStream, input: TokenStream) -> TokenStream {
                         {
                             let name: Cow<'static, str> = <#schema_types as utoipa::ToSchema>::name();
                             let schema = <#schema_types as utoipa::PartialSchema>::schema();
+                            // SAFETY: We intentionally leak memory here for 'static lifetime.
+                            // Schema names are typically few and small (e.g., "UserRequest", "LoginResponse"),
+                            // so the memory overhead is negligible for the lifetime of the program.
                             (Box::leak(name.into_owned().into_boxed_str()) as &'static str, schema)
                         }
                     ),*
@@ -178,139 +301,17 @@ pub fn route(args: TokenStream, input: TokenStream) -> TokenStream {
 
     let meta_mod_name = format_ident!("__{}_meta", fn_name);
 
-    // Build OpenAPI operation directly
-    let operation_builder = if let Some(req_type) = &request_type {
-        if let Some(resp_type) = &response_type {
-            quote! {
-                {
-                    use super::*;
-                    utoipa::openapi::path::OperationBuilder::new()
-                        .request_body(Some(utoipa::openapi::request_body::RequestBodyBuilder::new()
-                            .content(
-                                "application/json",
-                                utoipa::openapi::ContentBuilder::new()
-                                    .schema(Some(<#req_type as utoipa::PartialSchema>::schema()))
-                                    .build()
-                            )
-                            .build()))
-                        .response(
-                            "200",
-                            utoipa::openapi::ResponseBuilder::new()
-                                .description("")
-                                .content(
-                                    "application/json",
-                                    utoipa::openapi::ContentBuilder::new()
-                                        .schema(Some(<#resp_type as utoipa::PartialSchema>::schema()))
-                                        .build()
-                                )
-                                .build()
-                        )
-                        .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                        .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                        .build()
-                }
-            }
-        } else {
-            quote! {
-                {
-                    use super::*;
-                    utoipa::openapi::path::OperationBuilder::new()
-                        .request_body(Some(utoipa::openapi::request_body::RequestBodyBuilder::new()
-                            .content(
-                                "application/json",
-                                utoipa::openapi::ContentBuilder::new()
-                                    .schema(Some(<#req_type as utoipa::PartialSchema>::schema()))
-                                    .build()
-                            )
-                            .build()))
-                        .response("200", utoipa::openapi::ResponseBuilder::new().description("").build())
-                        .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                        .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                        .build()
-                }
-            }
-        }
-    } else if let Some(query_type) = &query_type {
-        if let Some(resp_type) = &response_type {
-            quote! {
-                {
-                    use super::*;
-                    utoipa::openapi::path::OperationBuilder::new()
-                        .parameters(Some(<#query_type as utoipa::IntoParams>::into_params(|| None)))
-                        .response(
-                            "200",
-                            utoipa::openapi::ResponseBuilder::new()
-                                .description("")
-                                .content(
-                                    "application/json",
-                                    utoipa::openapi::ContentBuilder::new()
-                                        .schema(Some(<#resp_type as utoipa::PartialSchema>::schema()))
-                                        .build()
-                                )
-                                .build()
-                        )
-                        .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                        .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                        .build()
-                }
-            }
-        } else {
-            quote! {
-                {
-                    use super::*;
-                    utoipa::openapi::path::OperationBuilder::new()
-                        .parameters(Some(<#query_type as utoipa::IntoParams>::into_params(|| None)))
-                        .response("200", utoipa::openapi::ResponseBuilder::new().description("").build())
-                        .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                        .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                        .build()
-                }
-            }
-        }
-    } else if let Some(resp_type) = &response_type {
-        quote! {
-            {
-                use super::*;
-                utoipa::openapi::path::OperationBuilder::new()
-                    .response(
-                        "200",
-                        utoipa::openapi::ResponseBuilder::new()
-                            .description("")
-                            .content(
-                                "application/json",
-                                utoipa::openapi::ContentBuilder::new()
-                                    .schema(Some(<#resp_type as utoipa::PartialSchema>::schema()))
-                                    .build()
-                            )
-                            .build()
-                    )
-                    .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                    .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                    .build()
-            }
-        }
-    } else {
-        quote! {
-            utoipa::openapi::path::OperationBuilder::new()
-                .response("200", utoipa::openapi::ResponseBuilder::new().description("").build())
-                .response("400", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                .response("500", utoipa::openapi::Ref::from_response_name("ErrorResponse"))
-                .build()
-        }
+    // Build OpenAPI operation using the configuration
+    let operation_config = OperationConfig {
+        request_type: request_type.as_ref(),
+        query_type: query_type.as_ref(),
+        response_type: response_type.as_ref(),
     };
-
-    let http_method = match method.as_str() {
-        "get" => quote! { utoipa::openapi::path::HttpMethod::Get },
-        "post" => quote! { utoipa::openapi::path::HttpMethod::Post },
-        "put" => quote! { utoipa::openapi::path::HttpMethod::Put },
-        "delete" => quote! { utoipa::openapi::path::HttpMethod::Delete },
-        "patch" => quote! { utoipa::openapi::path::HttpMethod::Patch },
-        _ => panic!("Unsupported HTTP method: {method}"),
-    };
+    let operation_builder = operation_config.build_operation();
 
     let path_item_builder = quote! {
         utoipa::openapi::path::PathItemBuilder::new()
-            .operation(#http_method, #operation_builder)
+            .operation(#utoipa_method, #operation_builder)
             .build()
     };
 
