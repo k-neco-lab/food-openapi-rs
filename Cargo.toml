@@ -3,10 +3,11 @@ name = "food-openapi-rs"
 version = "0.1.0"
 edition = "2021"
 
-[lib]
-proc-macro = true
-
 [dependencies]
-syn = { version = "2.0", features = ["full", "extra-traits"] }
-quote = "1.0"
-proc-macro2 = "1.0"
+food-openapi-rs-macros = { path = "./macros" }
+inventory = "0.3"
+utoipa = "5"
+
+# Re-export macros
+[package.metadata.docs.rs]
+all-features = true
