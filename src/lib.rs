@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use utoipa::openapi::{path::PathItem, Components, OpenApi, OpenApiBuilder, PathsBuilder, RefOr, Response};
+use utoipa::openapi::{
+    path::PathItem, Components, OpenApi, OpenApiBuilder, PathsBuilder, RefOr, Response,
+};
 
 /// Re-export inventory for macro use
 #[doc(hidden)]
@@ -41,7 +43,7 @@ inventory::collect!(SchemaProvider);
 
 /// Helper function to extract all $ref schema names from a schema
 fn extract_schema_refs(schema: &RefOr<utoipa::openapi::schema::Schema>) -> HashSet<String> {
-    use utoipa::openapi::schema::*;
+    use utoipa::openapi::schema::Schema;
 
     let mut refs = HashSet::new();
     let mut queue = VecDeque::new();
@@ -84,14 +86,14 @@ fn extract_schema_refs(schema: &RefOr<utoipa::openapi::schema::Schema>) -> HashS
                     queue.push_back(item);
                 }
             }
-            _ => {}
+            RefOr::T(_) => {}
         }
     }
 
     refs
 }
 
-/// Build an error response for use in OpenAPI components.responses
+/// Build an error response for use in `OpenAPI` components.responses
 ///
 /// This is a helper function to create a standard error response that can be
 /// referenced by all error status codes (400, 500, etc.).
@@ -136,8 +138,8 @@ pub fn build_openapi(title: &str, version: &str) -> OpenApi {
 
 /// Build `OpenAPI` documentation with standard error response
 ///
-/// This is the recommended way to build OpenAPI documentation.
-/// It automatically includes a standard ErrorResponse in components.responses
+/// This is the recommended way to build `OpenAPI` documentation.
+/// It automatically includes a standard `ErrorResponse` in `components.responses`
 /// and resolves all nested schema references.
 ///
 /// # Example
@@ -191,7 +193,10 @@ pub fn build_openapi_with_components<'a>(
     title: &str,
     version: &str,
     additional_schemas: impl IntoIterator<
-        Item = (&'a str, utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>),
+        Item = (
+            &'a str,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        ),
     >,
     error_response: Option<(&'a str, Response)>,
 ) -> OpenApi {
@@ -248,7 +253,9 @@ pub fn build_openapi_with_components<'a>(
 
     // Add error response if provided
     if let Some((name, response)) = error_response {
-        components.responses.insert(name.to_string(), RefOr::T(response));
+        components
+            .responses
+            .insert(name.to_string(), RefOr::T(response));
     }
 
     OpenApiBuilder::new()
